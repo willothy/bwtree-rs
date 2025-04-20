@@ -80,12 +80,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
         }
     }
 
-    pub fn insert<'a>(
-        &self,
-        key: K,
-        value: V,
-        guard: &'a crossbeam::epoch::Guard,
-    ) -> Result<(), ()> {
+    pub fn insert<'a>(&self, key: K, value: V, guard: &'a crossbeam::epoch::Guard) {
         let pid = self.find_leaf(ROOT_PID, &key, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
@@ -99,12 +94,6 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
 
         loop {
             let head = self.load(pid, &guard);
-
-            // Optimistically check if the key already exists
-            if let Some(_) = self.find_in_slot(pid, &key, &guard) {
-                // TODO: Handle updates
-                return Err(());
-            }
 
             match &*delta {
                 Page::Delta(DeltaEntry { next, .. }) => {
@@ -125,7 +114,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                 &guard,
             ) {
                 Ok(_) => {
-                    return Ok(());
+                    return;
                 }
                 Err(CompareExchangeError { new, .. }) => {
                     // Avoid cloning the delta on every iteration
@@ -189,9 +178,12 @@ fn basic_test() {
 
     assert_eq!(table.get(&1, &guard), None);
 
-    table.insert(1, 2, &guard).unwrap();
+    table.insert(1, 2, &guard);
     assert_eq!(table.get(&1, &guard), Some(&2));
 
-    table.insert(2, 3, &guard).unwrap();
+    table.insert(1, 3, &guard);
+    assert_eq!(table.get(&1, &guard), Some(&3));
+
+    table.insert(2, 3, &guard);
     assert_eq!(table.get(&2, &guard), Some(&3));
 }

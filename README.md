@@ -87,7 +87,6 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 
 ## 🚧 To Do
 
-* Implement updates
 * Implement page consolidation
 * Add range queries
 * Add delete operation
