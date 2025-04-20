@@ -1,6 +1,12 @@
-use std::ops::Deref;
+use std::{
+    ops::{Deref, Range},
+    sync::Arc,
+};
 
+use arc_slice::ArcSlice;
 use crossbeam::epoch::{Atomic, CompareExchangeError, Owned, Shared};
+
+mod arc_slice;
 
 #[derive(Debug, Clone, Copy)]
 struct PID(usize);
@@ -11,6 +17,7 @@ enum Delta<K, V> {
     Delete { key: K },
 
     SplitChild { separator: K, right: PID },
+    IndexEntry { separator: K, right: PID },
     // MergeSibling { separator: K, right: PID },
 }
 
@@ -22,11 +29,13 @@ struct DeltaEntry<K, V> {
 
 #[repr(C)]
 enum Page<K, V> {
-    BaseLeaf(Box<[(K, V)]>),
+    BaseLeaf(ArcSlice<(K, V)>),
+    BaseIndex(ArcSlice<(K, PID)>),
     Delta(DeltaEntry<K, V>),
 }
 
 const ROOT_PID: PID = PID(0);
+const MAX_BASE: usize = 512;
 
 #[derive(Debug)]
 pub struct Ref<'a, K, V> {
@@ -56,12 +65,12 @@ pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
 }
 
-impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
+impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
         // Root page
-        slots.push(Atomic::new(Page::BaseLeaf(Box::new([]))));
+        slots.push(Atomic::new(Page::BaseLeaf(ArcSlice::empty())));
 
         Self { slots }
     }
@@ -165,6 +174,68 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
         }
     }
 
+    fn split_base(&self, pid: PID) -> Result<(), ()> {
+        let guard = crossbeam::epoch::pin();
+
+        let node = self.load(pid, &guard);
+        let page = unsafe { &*node.as_raw() };
+
+        match page {
+            Page::BaseLeaf(items) => {
+                let mid = items.len() / 2;
+                let separator = items[mid].0.clone();
+
+                let right = items.slice(mid..);
+
+                let right_pid = PID(self.slots.push(Atomic::new(Page::BaseLeaf(right))));
+
+                let delta = Owned::new(Page::Delta(DeltaEntry::<K, V> {
+                    delta: Delta::SplitChild {
+                        separator: separator.clone(),
+                        right: right_pid,
+                    },
+                    next: Atomic::from(node),
+                }));
+
+                match self.slots[pid.0].compare_exchange(
+                    node,
+                    delta,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                    &guard,
+                ) {
+                    Ok(_) => {
+                        // Any search landing in `pid` with `key >= separator` will now follow
+                        // the side-link to `right_pid` and still find the correct record.
+                    }
+                    Err(_) => {
+                        // We lost the race - someone else split the page
+                        return Err(());
+                    }
+                }
+            }
+            Page::BaseIndex(_items) => {}
+            _ => {
+                panic!("Encountered an unexpected delta page. Split should only be called directly after consolidation.");
+            }
+        }
+
+        self.slots
+            .push(Atomic::new(Page::BaseLeaf(ArcSlice::empty())));
+
+        Ok(())
+    }
+
+    /// Allocates a new slot and returns its PID.
+    ///
+    /// Safety: This function is unsafe because it does not ensure that the
+    /// slot is initialized before it is used. The caller must ensure that
+    /// the slot is initialized.
+    unsafe fn alloc_pid(&self) -> PID {
+        let pid = self.slots.push(Atomic::null());
+        PID(pid)
+    }
+
     fn load<'a>(&self, index: PID, guard: &'a crossbeam::epoch::Guard) -> Shared<'a, Page<K, V>> {
         self.slots[index.0].load(std::sync::atomic::Ordering::Acquire, &guard)
     }
@@ -184,6 +255,17 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
                     Page::BaseLeaf(_) => {
                         return pid;
                     }
+                    Page::BaseIndex(items) => match items.binary_search_by_key(&key, |(k, _)| k) {
+                        Ok(index) => {
+                            let (_k, idx_pid) = &items[index];
+                            pid = *idx_pid;
+                            head = self.load(pid, guard);
+                            continue;
+                        }
+                        Err(_) => {
+                            return pid;
+                        }
+                    },
                     Page::Delta(DeltaEntry { delta, next }) => match delta {
                         Delta::SplitChild { separator, right } if key >= separator => {
                             pid = *right;
@@ -234,6 +316,14 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
                     _ => {
                         ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
                     }
+                },
+                Page::BaseIndex(items) => match items.binary_search_by_key(&key, |(k, _)| k) {
+                    Ok(index) => {
+                        let (_k, pid) = &items[index];
+                        ptr = self.load(*pid, guard);
+                        continue;
+                    }
+                    Err(_) => {}
                 },
                 Page::BaseLeaf(items) => {
                     return items
