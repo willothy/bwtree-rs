@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    ops::{Deref, Range},
-    sync::Arc,
-};
+use std::ops::Deref;
 
 use arc_slice::ArcSlice;
 use crossbeam::epoch::{Atomic, CompareExchangeError, Owned, Shared};
@@ -115,9 +111,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             next: Atomic::null(),
         }));
 
+        let mut head = self.load(pid, &guard);
         loop {
-            let head = self.load(pid, &guard);
-
             match &*delta {
                 Page::Delta(DeltaEntry { next, .. }) => {
                     // Update the next pointer to point to the current head.
@@ -139,9 +134,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 Ok(_) => {
                     break;
                 }
-                Err(CompareExchangeError { new, .. }) => {
+                Err(CompareExchangeError { new, current }) => {
                     // Avoid cloning the delta on every iteration
                     delta = new;
+
+                    head = current;
                 }
             }
         }
@@ -178,9 +175,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             next: Atomic::null(),
         }));
 
+        let mut head = self.load(pid, &guard);
         loop {
-            let head = self.load(pid, &guard);
-
             match &*delta {
                 Page::Delta(DeltaEntry { next, .. }) => {
                     // Update the next pointer to point to the current head.
@@ -202,9 +198,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 Ok(_) => {
                     break;
                 }
-                Err(CompareExchangeError { new, .. }) => {
+                Err(CompareExchangeError { new, current }) => {
                     // Avoid cloning the delta on every iteration
                     delta = new;
+
+                    head = current;
                 }
             }
         }
@@ -221,7 +219,9 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         let mut ops = vec![];
 
         let mut ptr = self.load(pid, guard);
+        let mut len = 0;
         while let Page::Delta(delta) = unsafe { &*ptr.as_raw() } {
+            len += 1;
             // We need to preserve the order of operations, but don't want to
             // traverse the delta chain twice.
             match &delta.delta {
@@ -235,6 +235,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
             ptr = delta.next.load(std::sync::atomic::Ordering::Acquire, guard);
         }
+
+        if len <= 8 {
+            return;
+        }
+
         let base = match unsafe { &*ptr.as_raw() } {
             Page::BaseLeaf(items) => items,
             _ => return, // someone beat us
@@ -271,7 +276,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 // We successfully consolidated the page.
                 // Now we need to check if we need to split the parent.
                 if len > MAX_BASE {
-                    self.split_base(pid, parent_pid).unwrap();
+                    while let Err(_) = self.split_base(pid, parent_pid) {}
                 }
             }
             Err(_) => {
@@ -399,6 +404,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         loop {
             stack.push(pid);
             let mut head = self.load(pid, guard);
+            // write!(std::io::stdout(), "head: {:?}", head).unwrap();
 
             'inner: loop {
                 // Safety: We are guaranteed that the pointer is non-null because we
