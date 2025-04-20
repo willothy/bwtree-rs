@@ -24,12 +24,13 @@ pub enum Page<K, V> {
     Delta(DeltaEntry<K, V>),
 }
 
-pub struct MappingTable<K, V> {
+const ROOT_PID: PID = PID(0);
+
+pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
-    root: PID,
 }
 
-impl<K: Ord + PartialEq + Clone + 'static, V> MappingTable<K, V> {
+impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
@@ -37,15 +38,12 @@ impl<K: Ord + PartialEq + Clone + 'static, V> MappingTable<K, V> {
             slots.push(Atomic::null());
         }
 
-        slots[0].store(
+        slots[ROOT_PID.0].store(
             Owned::new(Page::BaseLeaf(Box::new([]))),
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        Self {
-            slots,
-            root: PID(0),
-        }
+        Self { slots }
     }
 
     fn load<'a>(&self, index: PID, guard: &'a crossbeam::epoch::Guard) -> Shared<'a, Page<K, V>> {
@@ -88,7 +86,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> MappingTable<K, V> {
         value: V,
         guard: &'a crossbeam::epoch::Guard,
     ) -> Result<(), ()> {
-        let pid = self.find_leaf(self.root, &key, &guard);
+        let pid = self.find_leaf(ROOT_PID, &key, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
             delta: Delta::Insert {
@@ -138,7 +136,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> MappingTable<K, V> {
     }
 
     pub fn get<'a>(&self, key: &K, guard: &'a Guard) -> Option<&'a V> {
-        self.find_in_slot(self.root, key, guard)
+        self.find_in_slot(ROOT_PID, key, guard)
     }
 
     pub fn find_in_slot<'a>(&self, pid: PID, key: &K, guard: &'a Guard) -> Option<&'a V> {
@@ -185,7 +183,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> MappingTable<K, V> {
 
 #[test]
 fn basic_test() {
-    let table = MappingTable::<usize, usize>::new();
+    let table = BwTreeMap::<usize, usize>::new();
 
     let guard = crossbeam::epoch::pin();
 
