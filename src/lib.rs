@@ -30,7 +30,7 @@ pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
 }
 
-impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
+impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
@@ -84,10 +84,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
         let pid = self.find_leaf(ROOT_PID, &key, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
-            delta: Delta::Insert {
-                key: key.clone(),
-                value,
-            },
+            delta: Delta::Insert { key, value },
             // We should never actually read this null pointer
             next: Atomic::null(),
         }));
