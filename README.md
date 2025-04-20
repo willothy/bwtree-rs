@@ -16,7 +16,7 @@ BW-trees provide high concurrency and performance for modern multi-core systems.
 |----|-------------|
 | **Latch‑free** | All structural changes use a single `compare_exchange` on the mapping table. |
 | **Epoch‑based GC** | Memory is reclaimed safely with `crossbeam_epoch`; no hazards, no ABA. |
-| **Ordered + concurrent** | Point look‑ups match hash‑map speed while range scans are linear‑time. |
+| **Ordered + concurrent** | Point look‑ups match btree speed while range scans are linear‑time. |
 | **Familiar API** | `BwTreeMap` API matches the standard library's `BTreeMap` |
 | **Pluggable value type** | Any `Send + Sync + 'static` payload via generic `K` and `V`. |
 | **No `unsafe` in public API** | Internals use minimal `unsafe` blocks for raw pointers. |
