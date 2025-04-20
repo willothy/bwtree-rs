@@ -61,6 +61,34 @@ impl<'a, K, V> Deref for Ref<'a, K, V> {
     }
 }
 
+/// Return `true`   if `(sep → right_pid)` is already visible in `parent_head`.
+/// Return `false`  otherwise.
+fn has_index_entry<'a, K: Ord, V>(
+    mut head: Shared<'a, Page<K, V>>,
+    sep: &K, // KP of the split
+    guard: &'a crossbeam::epoch::Guard,
+) -> bool {
+    // Scan the delta chain first (cheap):
+    loop {
+        match unsafe { &*head.as_raw() } {
+            Page::Delta(DeltaEntry {
+                delta: Delta::IndexEntry { separator: s, .. },
+                next: _,
+            }) if s == sep => return true,
+            Page::Delta(d) => {
+                // next delta
+                head = d.next.load(std::sync::atomic::Ordering::Relaxed, &guard)
+            }
+            Page::BaseIndex(items) => {
+                // Fallback: binary search the consolidated base page.
+                // items is sorted by separator key.
+                return items.binary_search_by_key(&sep, |(k, _)| k).is_ok();
+            }
+            Page::BaseLeaf(_) => unreachable!("parent is never a leaf"),
+        }
+    }
+}
+
 pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
 }
@@ -77,7 +105,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
 
     pub fn insert<'a>(&self, key: K, value: V) {
         let guard = crossbeam::epoch::pin();
-        let pid = self.find_leaf(ROOT_PID, &key, &guard);
+        let mut stack = Vec::new();
+        let pid = self.find_leaf(ROOT_PID, &key, &mut stack, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
             delta: Delta::Insert { key, value },
@@ -134,7 +163,9 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
 
     pub fn delete<'a>(&self, key: K) {
         let guard = crossbeam::epoch::pin();
-        let pid = self.find_leaf(ROOT_PID, &key, &guard);
+
+        let mut stack = Vec::new();
+        let pid = self.find_leaf(ROOT_PID, &key, &mut stack, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
             delta: Delta::Delete { key },
@@ -174,7 +205,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
         }
     }
 
-    fn split_base(&self, pid: PID) -> Result<(), ()> {
+    fn split_base(&self, pid: PID, parent_pid: PID) -> Result<(), ()> {
         let guard = crossbeam::epoch::pin();
 
         let node = self.load(pid, &guard);
@@ -210,11 +241,63 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                     }
                     Err(_) => {
                         // We lost the race - someone else split the page
+                        //
+                        // retry
                         return Err(());
                     }
                 }
+
+                let mut parent_head = self.load(parent_pid, &guard);
+                let mut idx_delta = Owned::new(Page::Delta(DeltaEntry::<K, V> {
+                    delta: Delta::IndexEntry {
+                        separator: separator.clone(),
+                        right: right_pid,
+                    },
+                    next: Atomic::from(parent_head),
+                }));
+
+                loop {
+                    match self.slots[parent_pid.0].compare_exchange(
+                        parent_head,
+                        idx_delta,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                        &guard,
+                    ) {
+                        Ok(_) => {
+                            break;
+                        }
+                        Err(CompareExchangeError { new, current }) => {
+                            parent_head = current;
+
+                            if has_index_entry(parent_head, &separator, &guard) {
+                                // Someone else already added the index entry.
+                                //
+                                // Other threads help out when they see a SplitChild delta without
+                                // a corresponding IndexEntry delta.
+                                break;
+                            }
+
+                            // Avoid cloning the delta on every iteration
+                            idx_delta = new;
+
+                            // Update the next pointer to point to the current head.
+                            // This is necessary so that we can avoid reallocating the delta entry.
+                            match idx_delta.as_mut() {
+                                Page::Delta(delta_entry) => {
+                                    delta_entry
+                                        .next
+                                        .store(parent_head, std::sync::atomic::Ordering::Release);
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }
             }
-            Page::BaseIndex(_items) => {}
+            Page::BaseIndex(_items) => {
+                todo!("Split base index");
+            }
             _ => {
                 panic!("Encountered an unexpected delta page. Split should only be called directly after consolidation.");
             }
@@ -226,25 +309,22 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
         Ok(())
     }
 
-    /// Allocates a new slot and returns its PID.
-    ///
-    /// Safety: This function is unsafe because it does not ensure that the
-    /// slot is initialized before it is used. The caller must ensure that
-    /// the slot is initialized.
-    unsafe fn alloc_pid(&self) -> PID {
-        let pid = self.slots.push(Atomic::null());
-        PID(pid)
-    }
-
     fn load<'a>(&self, index: PID, guard: &'a crossbeam::epoch::Guard) -> Shared<'a, Page<K, V>> {
         self.slots[index.0].load(std::sync::atomic::Ordering::Acquire, &guard)
     }
 
-    fn find_leaf(&self, mut pid: PID, key: &K, guard: &crossbeam::epoch::Guard) -> PID {
+    fn find_leaf(
+        &self,
+        mut pid: PID,
+        key: &K,
+        stack: &mut Vec<PID>,
+        guard: &crossbeam::epoch::Guard,
+    ) -> PID {
         loop {
+            stack.push(pid);
             let mut head = self.load(pid, guard);
 
-            loop {
+            'inner: loop {
                 // Safety: We are guaranteed that the pointer is non-null because we
                 // always initialize slots before pointing at them. The allocation is guaranteed
                 // to be valid because we are holding a guard and the output's lifetime is bound
@@ -252,30 +332,26 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                 let page = unsafe { &*head.as_raw() };
 
                 match page {
+                    Page::Delta(DeltaEntry {
+                        delta: Delta::SplitChild { separator, right },
+                        ..
+                    }) if key >= separator => {
+                        pid = *right;
+                        head = self.load(pid, guard);
+                        continue 'inner;
+                    }
+                    Page::Delta(delta) => {
+                        head = delta.next.load(std::sync::atomic::Ordering::Acquire, guard);
+                    }
+                    Page::BaseIndex(items) => {
+                        pid = match items.binary_search_by_key(&key, |(k, _)| k) {
+                            Ok(i) | Err(i) => items[i].1,
+                        };
+                        break 'inner;
+                    }
                     Page::BaseLeaf(_) => {
                         return pid;
                     }
-                    Page::BaseIndex(items) => match items.binary_search_by_key(&key, |(k, _)| k) {
-                        Ok(index) => {
-                            let (_k, idx_pid) = &items[index];
-                            pid = *idx_pid;
-                            head = self.load(pid, guard);
-                            continue;
-                        }
-                        Err(_) => {
-                            return pid;
-                        }
-                    },
-                    Page::Delta(DeltaEntry { delta, next }) => match delta {
-                        Delta::SplitChild { separator, right } if key >= separator => {
-                            pid = *right;
-                            head = self.load(pid, guard);
-                            continue;
-                        }
-                        _ => {
-                            head = next.load(std::sync::atomic::Ordering::Acquire, guard);
-                        }
-                    },
                 }
             }
         }
