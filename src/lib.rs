@@ -178,7 +178,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
                 // always initialize slots before pointing at them. The allocation is guaranteed
                 // to be valid because we are holding a guard and the output's lifetime is bound
                 // to that of the guard.
-                let page = unsafe { head.as_ref() }.expect("non-null");
+                let page = unsafe { &*head.as_raw() };
 
                 match page {
                     Page::BaseLeaf(_) => {
@@ -212,7 +212,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
             // always initialize slots before pointing at them. The allocation is guaranteed
             // to be valid because we are holding a guard and the output's lifetime is bound
             // to that of the guard.
-            let page = unsafe { ptr.as_ref().expect("non-null") };
+            let page = unsafe { &*ptr.as_raw() };
 
             match page {
                 Page::Delta(DeltaEntry { delta, next }) => match delta {
