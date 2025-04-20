@@ -161,7 +161,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                 },
                 Page::BaseLeaf(items) => {
                     return items
-                        .binary_search_by_key(key, |(k, _)| k.clone())
+                        .binary_search_by_key(&key, |(k, _)| k)
                         .ok()
                         .map(|index| &items[index].1);
                 }
