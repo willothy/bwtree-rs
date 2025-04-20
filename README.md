@@ -55,15 +55,24 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 ```
       MappingTable                 Page 0
      ┌─┬─────────────────┐
-  PID│0│ AtomicPtr<Page> ├───────► Page::Delta(DeltaEntry {    ┌─► Page::Delta(DeltaEntry {          ┌─► Page::BaseLeaf(entries...)
-     ├─┼─────────────────┤             delta: Delta::Insert {  │       delta: Delta::SplitChild {    │
-  ┌─►│1│ AtomicPtr<Page> │                 k: ..., v: ...      │           separator: K,             │
-  │  ├─┼─────────────────┤             },                      │           right: PID(1),──────┐     │
-  │  │2│ <uninit>        │             next: AtomicPtr<Page> ──┘       },                      │     │
-  │  └─┴─────────────────┘         })                                  next: AtomicPtr<Page> ──┼─────┘
-  │                                                                })                          │
-  └────────────────────────────────────────────────────────────────────────────────────────────┘
-
+  PID│0│ AtomicPtr<Page> ├───────► Page::Delta(DeltaEntry {
+     ├─┼─────────────────┤             delta: Delta::Insert {
+  ┌─►│1│ AtomicPtr<Page> │                 k: ..., v: ...
+  │  ├─┼─────────────────┤             },
+  │  │2│ <uninit>        │             next: AtomicPtr<Page> ──┐
+  │  └─┴─────────────────┘         })                          │
+  │                                                            │
+  │┌───────────────────────────────────────────────────────────┘
+  ││
+  │└►Page::Delta(DeltaEntry {          ┌─► Page::BaseLeaf(entries...)
+  │      delta: Delta::SplitChild {    │
+  │          separator: K,             │
+  │          right: PID(1),─────────┐  │
+  │      },                         │  │
+  │      next: AtomicPtr<Page> ─────┼──┘
+  │  })                             │
+  │                                 │
+  └─────────────────────────────────┘
 
 ```
 
