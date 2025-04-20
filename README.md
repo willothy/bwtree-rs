@@ -88,8 +88,9 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 
 ## 📚 References
 
-* The Bw-Tree: A B-tree for New Hardware Platforms (Microsoft Research)
-* Building a Bw-Tree Takes More Than Just Buzz Words (CMU)
+* [The Bw-Tree: A B-tree for New Hardware Platforms (Microsoft Research)](https://15721.courses.cs.cmu.edu/spring2018/papers/08-oltpindexes1/bwtree-icde2013.pdf)
+* [Building a Bw-Tree Takes More Than Just Buzz Words (CMU)](https://db.cs.cmu.edu/papers/2018/mod342-wangA.pdf)
+  * Video talk [here](https://www.youtube.com/watch?v=UxuFL8dgiEw)
 
 ## 📜 License (Apache-2.0)
 
