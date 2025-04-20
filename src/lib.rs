@@ -60,14 +60,8 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
-        for _ in 0..4 {
-            slots.push(Atomic::null());
-        }
-
-        slots[ROOT_PID.0].store(
-            Owned::new(Page::BaseLeaf(Box::new([]))),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // Root page
+        slots.push(Atomic::new(Page::BaseLeaf(Box::new([]))));
 
         Self { slots }
     }
@@ -266,4 +260,139 @@ fn basic_test() {
 
     table.insert(2, 3);
     assert_eq!(table.get(&2).map(|x| *x), Some(&3));
+}
+
+#[test]
+fn insert_and_get_multiple_values() {
+    let tree = BwTreeMap::<i32, String>::new();
+
+    tree.insert(10, "ten".to_string());
+    tree.insert(20, "twenty".to_string());
+    tree.insert(30, "thirty".to_string());
+
+    assert_eq!(
+        tree.get(&10).map(|r| r.value().clone()),
+        Some("ten".to_string())
+    );
+    assert_eq!(
+        tree.get(&20).map(|r| r.value().clone()),
+        Some("twenty".to_string())
+    );
+    assert_eq!(
+        tree.get(&30).map(|r| r.value().clone()),
+        Some("thirty".to_string())
+    );
+    assert_eq!(tree.get(&40).map(|r| r.value()), None);
+}
+
+#[test]
+fn update_existing_values() {
+    let tree = BwTreeMap::<&str, i32>::new();
+
+    tree.insert("a", 1);
+    tree.insert("b", 2);
+    tree.insert("c", 3);
+
+    assert_eq!(tree.get(&"a").map(|r| *r.value()), Some(1));
+
+    tree.insert("a", 10);
+    tree.insert("b", 20);
+
+    assert_eq!(tree.get(&"a").map(|r| *r.value()), Some(10));
+    assert_eq!(tree.get(&"b").map(|r| *r.value()), Some(20));
+    assert_eq!(tree.get(&"c").map(|r| *r.value()), Some(3));
+}
+
+#[test]
+fn delete_values() {
+    let tree = BwTreeMap::<i32, &str>::new();
+
+    tree.insert(1, "one");
+    tree.insert(2, "two");
+    tree.insert(3, "three");
+
+    assert_eq!(tree.get(&1).map(|r| *r.value()), Some("one"));
+    assert_eq!(tree.get(&2).map(|r| *r.value()), Some("two"));
+
+    tree.delete(1);
+    assert_eq!(tree.get(&1).map(|r| r.value()), None);
+    assert_eq!(tree.get(&2).map(|r| *r.value()), Some("two"));
+
+    tree.delete(3);
+    assert_eq!(tree.get(&3).map(|r| r.value()), None);
+
+    tree.delete(2);
+    assert_eq!(tree.get(&2).map(|r| r.value()), None);
+}
+
+#[test]
+fn insert_after_delete() {
+    let tree = BwTreeMap::<usize, usize>::new();
+
+    tree.insert(42, 100);
+    assert_eq!(tree.get(&42).map(|r| *r.value()), Some(100));
+
+    tree.delete(42);
+    assert_eq!(tree.get(&42).map(|r| r.value()), None);
+
+    tree.insert(42, 200);
+    assert_eq!(tree.get(&42).map(|r| *r.value()), Some(200));
+}
+
+#[test]
+fn delete_nonexistent() {
+    let tree = BwTreeMap::<i32, i32>::new();
+
+    tree.insert(1, 10);
+    tree.insert(2, 20);
+
+    tree.delete(3); // Should not panic or cause issues
+
+    assert_eq!(tree.get(&1).map(|r| *r.value()), Some(10));
+    assert_eq!(tree.get(&2).map(|r| *r.value()), Some(20));
+}
+
+#[test]
+fn ref_key_value_accessors() {
+    let tree = BwTreeMap::<String, Vec<i32>>::new();
+
+    let key = "test".to_string();
+    let value = vec![1, 2, 3];
+
+    tree.insert(key.clone(), value.clone());
+
+    let reference = tree.get(&key).unwrap();
+
+    assert_eq!(reference.key(), &key);
+    assert_eq!(reference.value(), &value);
+    assert_eq!(**reference, value);
+}
+
+#[test]
+fn works_with_complex_types() {
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct TestKey {
+        id: i32,
+        name: String,
+    }
+
+    let tree = BwTreeMap::<TestKey, Vec<String>>::new();
+
+    let key1 = TestKey {
+        id: 1,
+        name: "first".to_string(),
+    };
+    let key2 = TestKey {
+        id: 2,
+        name: "second".to_string(),
+    };
+
+    let value1 = vec!["a".to_string(), "b".to_string()];
+    let value2 = vec!["c".to_string(), "d".to_string()];
+
+    tree.insert(key1.clone(), value1.clone());
+    tree.insert(key2.clone(), value2.clone());
+
+    assert_eq!(tree.get(&key1).map(|r| r.value().clone()), Some(value1));
+    assert_eq!(tree.get(&key2).map(|r| r.value().clone()), Some(value2));
 }
