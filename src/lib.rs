@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ops::{Deref, Range},
     sync::Arc,
 };
@@ -93,7 +94,7 @@ pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
 }
 
-impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
+impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
@@ -136,7 +137,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                 &guard,
             ) {
                 Ok(_) => {
-                    return;
+                    break;
                 }
                 Err(CompareExchangeError { new, .. }) => {
                     // Avoid cloning the delta on every iteration
@@ -144,6 +145,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                 }
             }
         }
+
+        let parent = stack.pop().unwrap();
+
+        self.maybe_consolidate(pid, parent, &guard);
     }
 
     pub fn get<'a>(&self, key: &K) -> Option<Ref<'a, K, V>> {
@@ -195,12 +200,83 @@ impl<K: Ord + PartialEq + Clone + 'static, V> BwTreeMap<K, V> {
                 &guard,
             ) {
                 Ok(_) => {
-                    return;
+                    break;
                 }
                 Err(CompareExchangeError { new, .. }) => {
                     // Avoid cloning the delta on every iteration
                     delta = new;
                 }
+            }
+        }
+
+        self.maybe_consolidate(pid, stack.pop().unwrap(), &guard);
+    }
+
+    fn maybe_consolidate(&self, pid: PID, parent_pid: PID, guard: &crossbeam::epoch::Guard) {
+        enum Op<'a, K, V> {
+            Insert { key: &'a K, value: &'a V },
+            Delete { key: &'a K },
+        }
+
+        let mut ops = vec![];
+
+        let mut ptr = self.load(pid, guard);
+        while let Page::Delta(delta) = unsafe { &*ptr.as_raw() } {
+            // We need to preserve the order of operations, but don't want to
+            // traverse the delta chain twice.
+            match &delta.delta {
+                Delta::Insert { key, value } => {
+                    ops.push(Op::Insert { key, value });
+                }
+                Delta::Delete { key } => {
+                    ops.push(Op::Delete { key });
+                }
+                _ => {}
+            }
+            ptr = delta.next.load(std::sync::atomic::Ordering::Acquire, guard);
+        }
+        let base = match unsafe { &*ptr.as_raw() } {
+            Page::BaseLeaf(items) => items,
+            _ => return, // someone beat us
+        };
+        let base_ptr = ptr;
+
+        let mut base_items = base.to_vec();
+        for op in ops.into_iter().rev() {
+            match op {
+                Op::Insert { key, value } => {
+                    let idx = match base_items.binary_search_by_key(&key, |(k, _)| k) {
+                        Ok(i) | Err(i) => i,
+                    };
+                    base_items.insert(idx, (key.clone(), value.clone()));
+                }
+                Op::Delete { key } => {
+                    if let Ok(idx) = base_items.binary_search_by_key(&key, |(k, _)| k) {
+                        base_items.remove(idx);
+                    };
+                }
+            }
+        }
+
+        let len = base_items.len();
+        let new_base = Owned::new(Page::BaseLeaf(ArcSlice::from_vec(base_items)));
+        match self.slots[pid.0].compare_exchange(
+            base_ptr,
+            new_base,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+            guard,
+        ) {
+            Ok(_) => {
+                // We successfully consolidated the page.
+                // Now we need to check if we need to split the parent.
+                if len > MAX_BASE {
+                    self.split_base(pid, parent_pid).unwrap();
+                }
+            }
+            Err(_) => {
+                // Someone else beat us to it.
+                // We don't need to do anything here.
             }
         }
     }
