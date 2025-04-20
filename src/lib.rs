@@ -129,6 +129,48 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
         }
     }
 
+    pub fn delete<'a>(&self, key: K) {
+        let guard = crossbeam::epoch::pin();
+        let pid = self.find_leaf(ROOT_PID, &key, &guard);
+
+        let mut delta = Owned::new(Page::Delta(DeltaEntry {
+            delta: Delta::Delete { key },
+            // We should never actually read this null pointer
+            next: Atomic::null(),
+        }));
+
+        loop {
+            let head = self.load(pid, &guard);
+
+            match &*delta {
+                Page::Delta(DeltaEntry { next, .. }) => {
+                    // Update the next pointer to point to the current head.
+                    //
+                    // This is necessary so that we can avoid reallocating the delta entry
+                    // on every iteration.
+                    next.store(head, std::sync::atomic::Ordering::Release);
+                }
+                _ => unreachable!(),
+            }
+
+            match self.slots[pid.0].compare_exchange(
+                head,
+                delta,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                &guard,
+            ) {
+                Ok(_) => {
+                    return;
+                }
+                Err(CompareExchangeError { new, .. }) => {
+                    // Avoid cloning the delta on every iteration
+                    delta = new;
+                }
+            }
+        }
+    }
+
     fn load<'a>(&self, index: PID, guard: &'a crossbeam::epoch::Guard) -> Shared<'a, Page<K, V>> {
         self.slots[index.0].load(std::sync::atomic::Ordering::Acquire, &guard)
     }
