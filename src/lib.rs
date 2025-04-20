@@ -1,4 +1,4 @@
-use crossbeam::epoch::{Atomic, CompareExchangeError, Guard, Owned, Shared};
+use crossbeam::epoch::{Atomic, CompareExchangeError, Owned, Shared};
 
 #[derive(Debug, Clone, Copy)]
 pub struct PID(usize);
@@ -10,6 +10,10 @@ pub enum Delta<K, V> {
 
     SplitChild { separator: K, right: PID },
     // MergeSibling { separator: K, right: PID },
+}
+
+pub struct Guard {
+    guard: crossbeam::epoch::Guard,
 }
 
 #[repr(C)]
@@ -50,7 +54,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
         self.slots[index.0].load(std::sync::atomic::Ordering::Acquire, &guard)
     }
 
-    fn find_leaf(&self, mut pid: PID, key: &K, guard: &Guard) -> PID {
+    fn find_leaf(&self, mut pid: PID, key: &K, guard: &crossbeam::epoch::Guard) -> PID {
         loop {
             let mut head = self.load(pid, guard);
 
@@ -80,8 +84,14 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
         }
     }
 
-    pub fn insert<'a>(&self, key: K, value: V, guard: &'a crossbeam::epoch::Guard) {
-        let pid = self.find_leaf(ROOT_PID, &key, &guard);
+    pub fn pin(&self) -> Guard {
+        Guard {
+            guard: crossbeam::epoch::pin(),
+        }
+    }
+
+    pub fn insert<'a>(&self, key: K, value: V, guard: &'a Guard) {
+        let pid = self.find_leaf(ROOT_PID, &key, &guard.guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
             delta: Delta::Insert { key, value },
@@ -90,7 +100,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
         }));
 
         loop {
-            let head = self.load(pid, &guard);
+            let head = self.load(pid, &guard.guard);
 
             match &*delta {
                 Page::Delta(DeltaEntry { next, .. }) => {
@@ -108,7 +118,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
                 delta,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
-                &guard,
+                &guard.guard,
             ) {
                 Ok(_) => {
                     return;
@@ -126,7 +136,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
     }
 
     pub fn find_in_slot<'a>(&self, pid: PID, key: &K, guard: &'a Guard) -> Option<&'a V> {
-        let mut ptr = self.load(pid, &guard);
+        let mut ptr = self.load(pid, &guard.guard);
 
         loop {
             // Safety: We are guaranteed that the pointer is non-null because we
@@ -148,12 +158,12 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
                         if key >= separator {
                             return self.find_in_slot(*right, key, guard);
                         } else {
-                            ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
+                            ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard.guard);
                         }
                     }
                     // Delta::MergeSibling { separator, right } => todo!(),
                     _ => {
-                        ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
+                        ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard.guard);
                     }
                 },
                 Page::BaseLeaf(items) => {
@@ -171,7 +181,7 @@ impl<K: Ord + PartialEq + 'static, V> BwTreeMap<K, V> {
 fn basic_test() {
     let table = BwTreeMap::<usize, usize>::new();
 
-    let guard = crossbeam::epoch::pin();
+    let guard = table.pin();
 
     assert_eq!(table.get(&1, &guard), None);
 
