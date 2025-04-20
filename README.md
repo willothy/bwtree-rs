@@ -38,11 +38,9 @@ use bwtree::BwTreeMap;
 
 let map = BwTreeMap::new();
 
-let guard = map.pin();
-
 // writers
-map.insert(42, "life", &guard).unwrap();
-map.insert(7,  "lucky", &guard).unwrap();
+map.insert(42, "life");
+map.insert(7,  "lucky");
 
 // readers
 assert_eq!(map.get(&42, &guard), Some("life"));
@@ -89,7 +87,6 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 
 * Implement page consolidation
 * Add range queries
-* Add delete operation
 * Implement page splitting for large pages
 * Add merge operations for sparse pages
 * Benchmarking against other concurrent data structures
