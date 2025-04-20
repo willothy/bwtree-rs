@@ -2,5 +2,9 @@
 name = "bwtree"
 version = "0.1.0"
 edition = "2024"
+description = "A Rust implementation of the Bw-tree data structure"
+license = "MIT"
 
 [dependencies]
+boxcar = "0.2.11"
+crossbeam = { version = "0.8.4", features = ["crossbeam-epoch"] }
