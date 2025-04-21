@@ -1,15 +1,16 @@
-use std::ops::Deref;
+use std::{ops::Deref, sync::atomic::AtomicUsize};
 
 use arc_slice::ArcSlice;
 use crossbeam::epoch::{Atomic, CompareExchangeError, Owned, Shared};
 
 mod arc_slice;
+pub mod visualization;
 
 #[derive(Debug, Clone, Copy)]
-struct PID(usize);
+pub struct PID(pub usize);
 
 #[repr(C)]
-enum Delta<K, V> {
+pub enum Delta<K, V> {
     Insert { key: K, value: V },
     Delete { key: K },
 
@@ -19,20 +20,20 @@ enum Delta<K, V> {
 }
 
 #[repr(C)]
-struct DeltaEntry<K, V> {
-    delta: Delta<K, V>,
-    next: Atomic<Page<K, V>>,
+pub struct DeltaEntry<K, V> {
+    pub delta: Delta<K, V>,
+    pub next: Atomic<Page<K, V>>,
 }
 
 #[repr(C)]
-enum Page<K, V> {
+pub enum Page<K, V> {
     BaseLeaf(ArcSlice<(K, V)>),
     BaseIndex(ArcSlice<(K, PID)>),
     Delta(DeltaEntry<K, V>),
 }
 
-const ROOT_PID: PID = PID(0);
 const MAX_BASE: usize = 512;
+const DELTA_CHAIN_THRESHOLD: usize = 16;
 
 #[derive(Debug)]
 pub struct Ref<'a, K, V> {
@@ -88,22 +89,29 @@ fn has_index_entry<'a, K: Ord, V>(
 
 pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
+    root: AtomicUsize,
 }
 
 impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
-        // Root page
-        slots.push(Atomic::new(Page::BaseLeaf(ArcSlice::empty())));
+        let root = slots.push(Atomic::new(Page::BaseLeaf(ArcSlice::empty())));
 
-        Self { slots }
+        Self {
+            slots,
+            root: root.into(),
+        }
+    }
+
+    pub(crate) fn root(&self) -> PID {
+        PID(self.root.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     pub fn insert<'a>(&self, key: K, value: V) {
         let guard = crossbeam::epoch::pin();
         let mut stack = Vec::new();
-        let pid = self.find_leaf(ROOT_PID, &key, &mut stack, &guard);
+        let pid = self.find_leaf(self.root(), &key, &mut stack, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
             delta: Delta::Insert { key, value },
@@ -145,21 +153,63 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
 
         let parent = stack.pop().unwrap();
 
-        self.maybe_consolidate(pid, parent, &guard);
+        self.maybe_consolidate(pid, parent, &guard).ok();
     }
 
     pub fn get<'a>(&self, key: &K) -> Option<Ref<'a, K, V>> {
         let guard = crossbeam::epoch::pin();
-        if let Some((k, v)) =
-            self.find_in_slot(ROOT_PID, key, unsafe { std::mem::transmute(&guard) })
-        {
-            Some(Ref {
-                _guard: guard,
-                key: k,
-                value: v,
-            })
-        } else {
-            None
+        let mut pid = self.root();
+
+        loop {
+            let mut head = self.load(pid, &guard);
+
+            while !head.is_null() {
+                match unsafe { &*head.as_raw() } {
+                    Page::Delta(delta_entry) => {
+                        head = delta_entry
+                            .next
+                            .load(std::sync::atomic::Ordering::Acquire, &guard);
+
+                        match &delta_entry.delta {
+                            Delta::Insert { key: k, value } if k == key => {
+                                return Some(Ref {
+                                    _guard: guard,
+                                    key: k,
+                                    value,
+                                });
+                            }
+                            Delta::Delete { key: k } if k == key => return None,
+                            Delta::SplitChild { separator, right } if key > separator => {
+                                pid = *right;
+                                head = self.load(pid, &guard);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Page::BaseLeaf(entries) => {
+                        return entries
+                            .binary_search_by_key(&key, |(k, _)| k)
+                            .ok()
+                            .map(|index| {
+                                let (k, v) = &entries[index];
+                                Ref {
+                                    _guard: guard,
+                                    key: k,
+                                    value: v,
+                                }
+                            });
+                    }
+                    Page::BaseIndex(entries) => {
+                        let index = match entries.binary_search_by_key(&key, |(k, _)| k) {
+                            Ok(index) => index,
+                            Err(index) => index,
+                        };
+                        pid = entries[index].1;
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -167,7 +217,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         let guard = crossbeam::epoch::pin();
 
         let mut stack = Vec::new();
-        let pid = self.find_leaf(ROOT_PID, &key, &mut stack, &guard);
+        let pid = self.find_leaf(self.root(), &key, &mut stack, &guard);
 
         let mut delta = Owned::new(Page::Delta(DeltaEntry {
             delta: Delta::Delete { key },
@@ -207,10 +257,16 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
         }
 
-        self.maybe_consolidate(pid, stack.pop().unwrap(), &guard);
+        self.maybe_consolidate(pid, stack.pop().unwrap(), &guard)
+            .ok();
     }
 
-    fn maybe_consolidate(&self, pid: PID, parent_pid: PID, guard: &crossbeam::epoch::Guard) {
+    fn maybe_consolidate(
+        &self,
+        pid: PID,
+        parent_pid: PID,
+        guard: &crossbeam::epoch::Guard,
+    ) -> Result<(), ()> {
         enum Op<'a, K, V> {
             Insert { key: &'a K, value: &'a V },
             Delete { key: &'a K },
@@ -219,9 +275,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         let mut ops = vec![];
 
         let mut ptr = self.load(pid, guard);
-        let mut len = 0;
+        let base_ptr = ptr;
         while let Page::Delta(delta) = unsafe { &*ptr.as_raw() } {
-            len += 1;
             // We need to preserve the order of operations, but don't want to
             // traverse the delta chain twice.
             match &delta.delta {
@@ -236,15 +291,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             ptr = delta.next.load(std::sync::atomic::Ordering::Acquire, guard);
         }
 
-        if len <= 8 {
-            return;
-        }
-
         let base = match unsafe { &*ptr.as_raw() } {
             Page::BaseLeaf(items) => items,
-            _ => return, // someone beat us
+            _ => return Err(()), // someone beat us
         };
-        let base_ptr = ptr;
 
         let mut base_items = base.to_vec();
         for op in ops.into_iter().rev() {
@@ -276,17 +326,20 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 // We successfully consolidated the page.
                 // Now we need to check if we need to split the parent.
                 if len > MAX_BASE {
-                    while let Err(_) = self.split_base(pid, parent_pid) {}
+                    // while let Err(_) = self.split_base(pid, parent_pid) {}
                 }
+                Ok(())
             }
-            Err(_) => {
+            Err(o) => {
+                println!("Failed to consolidate: {:?} {:?}", base_ptr, o);
                 // Someone else beat us to it.
                 // We don't need to do anything here.
+                Err(())
             }
         }
     }
 
-    fn split_base(&self, pid: PID, parent_pid: PID) -> Result<(), ()> {
+    fn try_split(&self, pid: PID, parent_pid: PID) -> Result<(), ()> {
         let guard = crossbeam::epoch::pin();
 
         let node = self.load(pid, &guard);
@@ -294,10 +347,24 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
 
         match page {
             Page::BaseLeaf(items) => {
+                if items.len() < DELTA_CHAIN_THRESHOLD * 2 {
+                    // We don't need to split the page.
+                    return Ok(());
+                }
+
                 let mid = items.len() / 2;
                 let separator = items[mid].0.clone();
 
+                let left = items.slice(..mid);
                 let right = items.slice(mid..);
+
+                let left_base = Owned::new(Page::BaseLeaf(left));
+                // let right_base = Owned::new(Page::BaseLeaf(right));
+
+                // let parent = Owned::new(Page::BaseIndex(ArcSlice::from_vec(vec![(
+                //     separator.clone(),
+                //     PID(0),
+                // )])));
 
                 let right_pid = PID(self.slots.push(Atomic::new(Page::BaseLeaf(right))));
 
@@ -390,7 +457,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         Ok(())
     }
 
-    fn load<'a>(&self, index: PID, guard: &'a crossbeam::epoch::Guard) -> Shared<'a, Page<K, V>> {
+    pub(crate) fn load<'a>(
+        &self,
+        index: PID,
+        guard: &'a crossbeam::epoch::Guard,
+    ) -> Shared<'a, Page<K, V>> {
         self.slots[index.0].load(std::sync::atomic::Ordering::Acquire, &guard)
     }
 
@@ -465,11 +536,19 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                     Delta::Delete { key: rec_key } if rec_key == key => return None,
                     Delta::SplitChild { separator, right } => {
                         if key >= separator {
-                            return self.find_in_slot(*right, key, guard);
+                            ptr = self.load(*right, guard);
+                            continue;
+                            // return self.find_in_slot(*right, key, guard);
                         } else {
                             ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
                         }
                     }
+                    // Delta::IndexEntry { separator, right } => {
+                    //     if key >= separator {
+                    //         ptr = self.load(*right, guard);
+                    //         continue;
+                    //     }
+                    // }
                     // Delta::MergeSibling { separator, right } => todo!(),
                     _ => {
                         ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
@@ -477,8 +556,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 },
                 Page::BaseIndex(items) => match items.binary_search_by_key(&key, |(k, _)| k) {
                     Ok(index) => {
-                        let (_k, pid) = &items[index];
-                        ptr = self.load(*pid, guard);
+                        // let (_k, pid) = &items[index];
+                        // ptr = self.load(*pid, guard);
                         continue;
                     }
                     Err(_) => {}
@@ -614,6 +693,57 @@ fn ref_key_value_accessors() {
     assert_eq!(reference.key(), &key);
     assert_eq!(reference.value(), &value);
     assert_eq!(**reference, value);
+}
+
+#[test]
+fn test_visualization() {
+    use crate::visualization::BwTreeVisualize;
+
+    let tree = BwTreeMap::<i32, String>::new();
+
+    // Insert some values to create a more complex structure
+    for i in 1..50 {
+        tree.insert(i, format!("value_{}", i));
+
+        // Delete some values to create delete deltas
+        if i % 5 == 0 {
+            tree.delete(i);
+        }
+    }
+
+    for i in 1..50 {
+        if i % 5 == 0 {
+            let res = tree.get(&i);
+            assert_eq!(res.map(|r| r.value().clone()), None);
+        } else {
+            let res = tree.get(&i);
+            assert_eq!(res.map(|r| r.value().clone()), Some(format!("value_{}", i)));
+        }
+    }
+
+    // {
+    //     let guard = crossbeam::epoch::pin();
+    //     tree.maybe_consolidate(PID(0), PID(0), &guard).unwrap();
+    // }
+    //
+    // tree.split_base(PID(0), PID(0)).unwrap();
+
+    for i in 1..50 {
+        if i % 5 == 0 {
+            let res = tree.get(&i);
+            assert_eq!(res.map(|r| r.value().clone()), None);
+        } else {
+            let res = tree.get(&i);
+            assert_eq!(res.map(|r| r.value().clone()), Some(format!("value_{}", i)));
+        }
+    }
+
+    // Create and save visualization
+    let _dot = tree.visualize();
+
+    // Uncomment to save the file
+    tree.save_visualization("bwtree_test_visualization.dot")
+        .unwrap();
 }
 
 #[test]
