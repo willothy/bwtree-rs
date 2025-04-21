@@ -27,9 +27,18 @@ pub struct DeltaEntry<K, V> {
 
 #[repr(C)]
 pub enum Page<K, V> {
-    BaseLeaf(ArcSlice<(K, V)>),
-    BaseIndex(ArcSlice<(K, PID)>),
-    Delta(DeltaEntry<K, V>),
+    BaseLeaf {
+        entries: ArcSlice<(K, V)>,
+        side_link: Option<PID>,
+    },
+    BaseIndex {
+        entries: ArcSlice<(K, PID)>,
+        side_link: Option<PID>,
+    },
+    Delta {
+        delta: Delta<K, V>,
+        next: Atomic<Page<K, V>>,
+    },
 }
 
 const MAX_BASE: usize = 512;
@@ -69,20 +78,20 @@ fn has_index_entry<'a, K: Ord, V>(
     // Scan the delta chain first (cheap):
     loop {
         match unsafe { &*head.as_raw() } {
-            Page::Delta(DeltaEntry {
+            Page::Delta {
                 delta: Delta::IndexEntry { separator: s, .. },
                 next: _,
-            }) if s == sep => return true,
-            Page::Delta(d) => {
+            } if s == sep => return true,
+            Page::Delta { next, .. } => {
                 // next delta
-                head = d.next.load(std::sync::atomic::Ordering::Relaxed, &guard)
+                head = next.load(std::sync::atomic::Ordering::Relaxed, &guard)
             }
-            Page::BaseIndex(items) => {
+            Page::BaseIndex { entries: items, .. } => {
                 // Fallback: binary search the consolidated base page.
                 // items is sorted by separator key.
                 return items.binary_search_by_key(&sep, |(k, _)| k).is_ok();
             }
-            Page::BaseLeaf(_) => unreachable!("parent is never a leaf"),
+            Page::BaseLeaf { .. } => unreachable!("parent is never a leaf"),
         }
     }
 }
@@ -96,7 +105,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     pub fn new() -> Self {
         let slots = boxcar::Vec::with_capacity(4);
 
-        let root = slots.push(Atomic::new(Page::BaseLeaf(ArcSlice::empty())));
+        let root = slots.push(Atomic::new(Page::BaseLeaf {
+            entries: ArcSlice::empty(),
+            side_link: None,
+        }));
 
         Self {
             slots,
@@ -113,16 +125,16 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         let mut stack = Vec::new();
         let pid = self.find_leaf(self.root(), &key, &mut stack, &guard);
 
-        let mut delta = Owned::new(Page::Delta(DeltaEntry {
+        let mut delta = Owned::new(Page::Delta {
             delta: Delta::Insert { key, value },
             // We should never actually read this null pointer
             next: Atomic::null(),
-        }));
+        });
 
         let mut head = self.load(pid, &guard);
         loop {
             match &*delta {
-                Page::Delta(DeltaEntry { next, .. }) => {
+                Page::Delta { next, .. } => {
                     // Update the next pointer to point to the current head.
                     //
                     // This is necessary so that we can avoid reallocating the delta entry
@@ -165,12 +177,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
 
             while !head.is_null() {
                 match unsafe { &*head.as_raw() } {
-                    Page::Delta(delta_entry) => {
-                        head = delta_entry
-                            .next
-                            .load(std::sync::atomic::Ordering::Acquire, &guard);
+                    Page::Delta { delta, next } => {
+                        head = next.load(std::sync::atomic::Ordering::Acquire, &guard);
 
-                        match &delta_entry.delta {
+                        match &delta {
                             Delta::Insert { key: k, value } if k == key => {
                                 return Some(Ref {
                                     _guard: guard,
@@ -187,7 +197,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                         }
                         continue;
                     }
-                    Page::BaseLeaf(entries) => {
+                    Page::BaseLeaf { entries, .. } => {
                         return entries
                             .binary_search_by_key(&key, |(k, _)| k)
                             .ok()
@@ -200,7 +210,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                                 }
                             });
                     }
-                    Page::BaseIndex(entries) => {
+                    Page::BaseIndex { entries, .. } => {
                         let index = match entries.binary_search_by_key(&key, |(k, _)| k) {
                             Ok(index) => index,
                             Err(index) => index,
@@ -219,16 +229,16 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         let mut stack = Vec::new();
         let pid = self.find_leaf(self.root(), &key, &mut stack, &guard);
 
-        let mut delta = Owned::new(Page::Delta(DeltaEntry {
+        let mut delta = Owned::new(Page::Delta {
             delta: Delta::Delete { key },
             // We should never actually read this null pointer
             next: Atomic::null(),
-        }));
+        });
 
         let mut head = self.load(pid, &guard);
         loop {
             match &*delta {
-                Page::Delta(DeltaEntry { next, .. }) => {
+                Page::Delta { next, .. } => {
                     // Update the next pointer to point to the current head.
                     //
                     // This is necessary so that we can avoid reallocating the delta entry
@@ -276,10 +286,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
 
         let mut ptr = self.load(pid, guard);
         let base_ptr = ptr;
-        while let Page::Delta(delta) = unsafe { &*ptr.as_raw() } {
+        while let Page::Delta { delta, next } = unsafe { &*ptr.as_raw() } {
             // We need to preserve the order of operations, but don't want to
             // traverse the delta chain twice.
-            match &delta.delta {
+            match &delta {
                 Delta::Insert { key, value } => {
                     ops.push(Op::Insert { key, value });
                 }
@@ -288,11 +298,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 }
                 _ => {}
             }
-            ptr = delta.next.load(std::sync::atomic::Ordering::Acquire, guard);
+            ptr = next.load(std::sync::atomic::Ordering::Acquire, guard);
         }
 
         let base = match unsafe { &*ptr.as_raw() } {
-            Page::BaseLeaf(items) => items,
+            Page::BaseLeaf { entries: items, .. } => items,
             _ => return Err(()), // someone beat us
         };
 
@@ -314,7 +324,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         }
 
         let len = base_items.len();
-        let new_base = Owned::new(Page::BaseLeaf(ArcSlice::from_vec(base_items)));
+        let new_base = Owned::new(Page::BaseLeaf {
+            entries: ArcSlice::from_vec(base_items),
+            side_link: None,
+        });
         match self.slots[pid.0].compare_exchange(
             base_ptr,
             new_base,
@@ -346,7 +359,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         let page = unsafe { &*node.as_raw() };
 
         match page {
-            Page::BaseLeaf(items) => {
+            Page::BaseLeaf { entries: items, .. } => {
                 if items.len() < DELTA_CHAIN_THRESHOLD * 2 {
                     // We don't need to split the page.
                     return Ok(());
@@ -358,7 +371,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 let left = items.slice(..mid);
                 let right = items.slice(mid..);
 
-                let left_base = Owned::new(Page::BaseLeaf(left));
+                let left_base = Owned::new(Page::BaseLeaf {
+                    entries: left,
+                    side_link: None,
+                });
                 // let right_base = Owned::new(Page::BaseLeaf(right));
 
                 // let parent = Owned::new(Page::BaseIndex(ArcSlice::from_vec(vec![(
@@ -366,15 +382,18 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 //     PID(0),
                 // )])));
 
-                let right_pid = PID(self.slots.push(Atomic::new(Page::BaseLeaf(right))));
+                let right_pid = PID(self.slots.push(Atomic::new(Page::BaseLeaf {
+                    entries: right,
+                    side_link: None,
+                })));
 
-                let delta = Owned::new(Page::Delta(DeltaEntry::<K, V> {
+                let delta = Owned::new(Page::Delta {
                     delta: Delta::SplitChild {
                         separator: separator.clone(),
                         right: right_pid,
                     },
                     next: Atomic::from(node),
-                }));
+                });
 
                 match self.slots[pid.0].compare_exchange(
                     node,
@@ -396,13 +415,13 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 }
 
                 let mut parent_head = self.load(parent_pid, &guard);
-                let mut idx_delta = Owned::new(Page::Delta(DeltaEntry::<K, V> {
+                let mut idx_delta = Owned::new(Page::Delta {
                     delta: Delta::IndexEntry {
                         separator: separator.clone(),
                         right: right_pid,
                     },
                     next: Atomic::from(parent_head),
-                }));
+                });
 
                 loop {
                     match self.slots[parent_pid.0].compare_exchange(
@@ -432,10 +451,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                             // Update the next pointer to point to the current head.
                             // This is necessary so that we can avoid reallocating the delta entry.
                             match idx_delta.as_mut() {
-                                Page::Delta(delta_entry) => {
-                                    delta_entry
-                                        .next
-                                        .store(parent_head, std::sync::atomic::Ordering::Release);
+                                Page::Delta { next, .. } => {
+                                    next.store(parent_head, std::sync::atomic::Ordering::Release);
                                 }
                                 _ => unreachable!(),
                             }
@@ -443,7 +460,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                     }
                 }
             }
-            Page::BaseIndex(_items) => {
+            Page::BaseIndex { .. } => {
                 todo!("Split base index");
             }
             _ => {
@@ -451,8 +468,10 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
         }
 
-        self.slots
-            .push(Atomic::new(Page::BaseLeaf(ArcSlice::empty())));
+        self.slots.push(Atomic::new(Page::BaseLeaf {
+            entries: ArcSlice::empty(),
+            side_link: None,
+        }));
 
         Ok(())
     }
@@ -485,24 +504,24 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 let page = unsafe { &*head.as_raw() };
 
                 match page {
-                    Page::Delta(DeltaEntry {
+                    Page::Delta {
                         delta: Delta::SplitChild { separator, right },
                         ..
-                    }) if key >= separator => {
+                    } if key >= separator => {
                         pid = *right;
                         head = self.load(pid, guard);
                         continue 'inner;
                     }
-                    Page::Delta(delta) => {
-                        head = delta.next.load(std::sync::atomic::Ordering::Acquire, guard);
+                    Page::Delta { next, .. } => {
+                        head = next.load(std::sync::atomic::Ordering::Acquire, guard);
                     }
-                    Page::BaseIndex(items) => {
+                    Page::BaseIndex { entries: items, .. } => {
                         pid = match items.binary_search_by_key(&key, |(k, _)| k) {
                             Ok(i) | Err(i) => items[i].1,
                         };
                         break 'inner;
                     }
-                    Page::BaseLeaf(_) => {
+                    Page::BaseLeaf { .. } => {
                         return pid;
                     }
                 }
@@ -526,7 +545,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             let page = unsafe { &*ptr.as_raw() };
 
             match page {
-                Page::Delta(DeltaEntry { delta, next }) => match delta {
+                Page::Delta { delta, next } => match delta {
                     Delta::Insert {
                         key: rec_key,
                         value,
@@ -554,15 +573,17 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                         ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
                     }
                 },
-                Page::BaseIndex(items) => match items.binary_search_by_key(&key, |(k, _)| k) {
-                    Ok(index) => {
-                        // let (_k, pid) = &items[index];
-                        // ptr = self.load(*pid, guard);
-                        continue;
+                Page::BaseIndex { entries: items, .. } => {
+                    match items.binary_search_by_key(&key, |(k, _)| k) {
+                        Ok(index) => {
+                            // let (_k, pid) = &items[index];
+                            // ptr = self.load(*pid, guard);
+                            continue;
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
-                },
-                Page::BaseLeaf(items) => {
+                }
+                Page::BaseLeaf { entries: items, .. } => {
                     return items
                         .binary_search_by_key(&key, |(k, _)| k)
                         .ok()

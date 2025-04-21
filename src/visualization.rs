@@ -88,7 +88,7 @@ where
         // Process the node based on its type
         let page = unsafe { &*ptr.as_raw() };
         match page {
-            Page::BaseLeaf(items) => {
+            Page::BaseLeaf { entries: items, .. } => {
                 let label = format!(
                     "BaseLeaf PID={}\n{}",
                     pid.0,
@@ -102,7 +102,7 @@ where
                     label,
                 });
             }
-            Page::BaseIndex(items) => {
+            Page::BaseIndex { entries: items, .. } => {
                 let label = format!(
                     "BaseIndex PID={}\n{}",
                     pid.0,
@@ -126,14 +126,12 @@ where
                     });
                 }
             }
-            Page::Delta(delta) => {
+            Page::Delta { delta, next } => {
                 // Process this delta node
                 self.process_delta(pid, ptr, node_id, delta);
 
                 // Follow the delta chain
-                let next_ptr = delta
-                    .next
-                    .load(std::sync::atomic::Ordering::Acquire, &self.guard);
+                let next_ptr = next.load(std::sync::atomic::Ordering::Acquire, &self.guard);
                 let next_node_id = self.nodes.len();
 
                 // Add next node
@@ -157,9 +155,9 @@ where
         pid: PID,
         ptr: Shared<'a, Page<K, V>>,
         node_id: usize,
-        delta: &DeltaEntry<K, V>,
+        delta: &Delta<K, V>,
     ) {
-        let label = match &delta.delta {
+        let label = match &delta {
             Delta::Insert { key, value } => {
                 format!("Delta::Insert PID={}\nkey={}, value={}", pid.0, key, value)
             }
@@ -205,7 +203,7 @@ where
     fn process_next_node(&mut self, ptr: Shared<'a, Page<K, V>>, node_id: usize) {
         let page = unsafe { &*ptr.as_raw() };
         match page {
-            Page::BaseLeaf(items) => {
+            Page::BaseLeaf { entries: items, .. } => {
                 let label = format!("BaseLeaf\n{}", self.format_items(items.as_slice()));
                 self.nodes.push(NodeData {
                     id: node_id,
@@ -215,7 +213,7 @@ where
                     label,
                 });
             }
-            Page::BaseIndex(items) => {
+            Page::BaseIndex { entries: items, .. } => {
                 let label = format!("BaseIndex\n{}", self.format_index_items(items.as_slice()));
                 self.nodes.push(NodeData {
                     id: node_id,
@@ -227,14 +225,12 @@ where
 
                 // We won't follow the children here to avoid circular references
             }
-            Page::Delta(delta) => {
+            Page::Delta { delta, next } => {
                 // Process this delta node
                 self.process_delta(PID(0), ptr, node_id, delta);
 
                 // Follow the delta chain
-                let next_ptr = delta
-                    .next
-                    .load(std::sync::atomic::Ordering::Acquire, &self.guard);
+                let next_ptr = next.load(std::sync::atomic::Ordering::Acquire, &self.guard);
                 let next_node_id = self.nodes.len();
 
                 // Add next node
