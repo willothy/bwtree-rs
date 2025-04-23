@@ -15,23 +15,35 @@ pub struct BwTreeGraph<'a, K: Display + Ord + PartialEq + Clone + 'static, V: Di
     guard: &'a Guard,
     nodes: Vec<NodeData<'a, K, V>>,
     edges: Vec<EdgeData>,
-    pid_to_node_id: HashMap<usize, usize>,
+    // Track which nodes we've already processed
+    node_indices: HashMap<NodeId, usize>, // NodeId -> index in nodes vector
 }
 
+/// A unique identifier for a node in the visualization
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NodeId {
+    // The page ID
+    pid: usize,
+    // Position in the delta chain (0 = top of chain)
+    chain_pos: usize,
+}
+
+/// Metadata for a node in the visualization
 struct NodeData<'a, K: Display, V: Display> {
-    id: usize,
-    pid: PID,
+    id: NodeId,
     node_type: NodeType,
     page: Shared<'a, Page<K, V>>,
     label: String,
 }
 
+/// Edge between two nodes in the visualization
 struct EdgeData {
-    source: usize,
-    target: usize,
+    source: NodeId,
+    target: NodeId,
     label: String,
 }
 
+/// Types of nodes in the BwTree
 enum NodeType {
     BaseLeaf,
     BaseIndex,
@@ -50,11 +62,15 @@ where
             guard,
             nodes: Vec::new(),
             edges: Vec::new(),
-            pid_to_node_id: HashMap::new(),
+            node_indices: HashMap::new(),
         };
 
-        // Start with the root node (PID 0)
-        graph.traverse_from_pid(tree.root());
+        // Start with the root node (PID 0, position 0)
+        let root_id = NodeId {
+            pid: tree.root().0,
+            chain_pos: 0,
+        };
+        graph.process_chain(root_id.pid);
 
         graph
     }
@@ -74,27 +90,127 @@ where
         Ok(())
     }
 
-    /// Helper function to traverse and build the graph from a specific PID
-    fn traverse_from_pid(&mut self, pid: PID) -> usize {
-        // If we've already processed this PID, return its node ID
-        if let Some(&node_id) = self.pid_to_node_id.get(&pid.0) {
-            return node_id;
+    /// Process an entire delta chain starting from a specific PID
+    fn process_chain(&mut self, pid: usize) -> usize {
+        // Process the head node (chain_pos = 0)
+        let head_id = NodeId { pid, chain_pos: 0 };
+        let head_idx = self.process_node(head_id);
+
+        // Connect to any referenced nodes (SplitChild, IndexEntry) and their chains
+        let head_ptr = self.tree.load(PID(pid), &self.guard);
+        self.follow_references(head_id, head_ptr);
+
+        head_idx
+    }
+
+    /// Follow references from a node to other chains (SplitChild, IndexEntry)
+    fn follow_references(&mut self, node_id: NodeId, ptr: Shared<'a, Page<K, V>>) {
+        let page = unsafe { &*ptr.as_raw() };
+
+        match page {
+            Page::Delta { delta, next } => {
+                match delta {
+                    Delta::SplitChild { right, .. } | Delta::IndexEntry { right, .. } => {
+                        // Process the referenced chain if not already processed
+                        let target_id = NodeId {
+                            pid: right.0,
+                            chain_pos: 0,
+                        };
+                        if !self.node_indices.contains_key(&target_id) {
+                            self.process_chain(right.0);
+                        }
+
+                        // Create an edge to the referenced chain
+                        let target_idx = self.node_indices[&target_id];
+                        self.edges.push(EdgeData {
+                            source: node_id,
+                            target: target_id,
+                            label: "right".to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+
+                // Follow the next pointer in this chain
+                let next_ptr = next.load(std::sync::atomic::Ordering::Acquire, &self.guard);
+                let next_id = NodeId {
+                    pid: node_id.pid,
+                    chain_pos: node_id.chain_pos + 1,
+                };
+                if !self.node_indices.contains_key(&next_id) {
+                    let next_idx = self.process_node(next_id);
+                    self.follow_references(next_id, next_ptr);
+
+                    // Create an edge to the next node in the chain
+                    self.edges.push(EdgeData {
+                        source: node_id,
+                        target: next_id,
+                        label: "next".to_string(),
+                    });
+                }
+            }
+            Page::BaseIndex { entries, .. } => {
+                // Process all children in the index
+                for (idx, (_, child_pid)) in entries.iter().enumerate() {
+                    let child_id = NodeId {
+                        pid: child_pid.0,
+                        chain_pos: 0,
+                    };
+                    if !self.node_indices.contains_key(&child_id) {
+                        self.process_chain(child_pid.0);
+                    }
+
+                    // Create edges to all children
+                    self.edges.push(EdgeData {
+                        source: node_id,
+                        target: child_id,
+                        label: format!("idx={}", idx),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Process a single node and add it to the graph
+    fn process_node(&mut self, node_id: NodeId) -> usize {
+        // If we've already processed this node, return its index
+        if let Some(&idx) = self.node_indices.get(&node_id) {
+            return idx;
         }
 
+        // Get the page from the tree
+        let pid = PID(node_id.pid);
         let ptr = self.tree.load(pid, &self.guard);
-        let node_id = self.nodes.len();
-        self.pid_to_node_id.insert(pid.0, node_id);
+
+        // Find the correct node in the delta chain
+        let mut current_ptr = ptr;
+        let mut chain_pos = 0;
+
+        while chain_pos < node_id.chain_pos {
+            match unsafe { &*current_ptr.as_raw() } {
+                Page::Delta { next, .. } => {
+                    current_ptr = next.load(std::sync::atomic::Ordering::Acquire, &self.guard);
+                    chain_pos += 1;
+                }
+                _ => break, // Reached a base page
+            }
+        }
+
+        let idx = self.nodes.len();
+        self.node_indices.insert(node_id, idx);
 
         // Process the node based on its type
-        let page = unsafe { &*ptr.as_raw() };
+        let page = unsafe { &*current_ptr.as_raw() };
         match page {
             Page::BaseLeaf {
                 entries: items,
                 side_link,
             } => {
                 let label = format!(
-                    "BaseLeaf PID={} SIDE_LINK={} ({} count)\n{}",
-                    pid.0,
+                    "BaseLeaf\nPID={}, chain_pos={}\nSIDE_LINK={} ({} count)\n{}",
+                    node_id.pid,
+                    node_id.chain_pos,
                     side_link
                         .map(|l| l.0.to_string())
                         .unwrap_or_else(|| "none".to_string()),
@@ -103,19 +219,29 @@ where
                 );
                 self.nodes.push(NodeData {
                     id: node_id,
-                    pid,
                     node_type: NodeType::BaseLeaf,
-                    page: ptr,
+                    page: current_ptr,
                     label,
                 });
+                if let Some(side_link) = side_link {
+                    self.edges.push(EdgeData {
+                        source: node_id,
+                        target: NodeId {
+                            pid: side_link.0,
+                            chain_pos: 0,
+                        },
+                        label: "side_link".to_owned(),
+                    })
+                }
             }
             Page::BaseIndex {
                 entries: items,
                 side_link,
             } => {
                 let label = format!(
-                    "BaseIndex PID={} SIDE_LINK={} ({} count)\n{}",
-                    pid.0,
+                    "BaseIndex\nPID={}, chain_pos={}\nSIDE_LINK={} ({} count)\n{}",
+                    node_id.pid,
+                    node_id.chain_pos,
                     side_link
                         .map(|l| l.0.to_string())
                         .unwrap_or_else(|| "none".to_string()),
@@ -124,140 +250,49 @@ where
                 );
                 self.nodes.push(NodeData {
                     id: node_id,
-                    pid,
                     node_type: NodeType::BaseIndex,
-                    page: ptr,
+                    page: current_ptr,
                     label,
                 });
-
-                // Add edges to all children
-                for (idx, (_key, child_pid)) in items.iter().enumerate() {
-                    let child_node_id = self.traverse_from_pid(*child_pid);
-                    self.edges.push(EdgeData {
-                        source: node_id,
-                        target: child_node_id,
-                        label: format!("idx={}", idx),
-                    });
-                }
             }
-            Page::Delta { delta, next } => {
-                // Process this delta node
-                self.process_delta(pid, ptr, node_id, delta);
+            Page::Delta { delta, .. } => {
+                let label = match delta {
+                    Delta::Insert { key, value } => {
+                        format!(
+                            "Delta::Insert\nPID={}, chain_pos={}\nkey={}, value={}",
+                            node_id.pid, node_id.chain_pos, key, value
+                        )
+                    }
+                    Delta::Delete { key } => {
+                        format!(
+                            "Delta::Delete\nPID={}, chain_pos={}\nkey={}",
+                            node_id.pid, node_id.chain_pos, key
+                        )
+                    }
+                    Delta::SplitChild { separator, right } => {
+                        format!(
+                            "Delta::SplitChild\nPID={}, chain_pos={}\nsep={}, right={}",
+                            node_id.pid, node_id.chain_pos, separator, right.0
+                        )
+                    }
+                    Delta::IndexEntry { separator, right } => {
+                        format!(
+                            "Delta::IndexEntry\nPID={}, chain_pos={}\nsep={}, right={}",
+                            node_id.pid, node_id.chain_pos, separator, right.0
+                        )
+                    }
+                };
 
-                // Follow the delta chain
-                let next_ptr = next.load(std::sync::atomic::Ordering::Acquire, &self.guard);
-                let next_node_id = self.nodes.len();
-
-                // Add next node
-                self.process_next_node(next_ptr, next_node_id);
-
-                // Add edge to next node in delta chain
-                self.edges.push(EdgeData {
-                    source: node_id,
-                    target: next_node_id,
-                    label: "next".to_string(),
+                self.nodes.push(NodeData {
+                    id: node_id,
+                    node_type: NodeType::Delta,
+                    page: current_ptr,
+                    label,
                 });
             }
         }
 
-        node_id
-    }
-
-    /// Process a delta node and add it to the graph
-    fn process_delta(
-        &mut self,
-        pid: PID,
-        ptr: Shared<'a, Page<K, V>>,
-        node_id: usize,
-        delta: &Delta<K, V>,
-    ) {
-        let label = match &delta {
-            Delta::Insert { key, value } => {
-                format!("Delta::Insert PID={}\nkey={}, value={}", pid.0, key, value)
-            }
-            Delta::Delete { key } => {
-                format!("Delta::Delete PID={}\nkey={}", pid.0, key)
-            }
-            Delta::SplitChild { separator, right } => {
-                let right_node_id = self.traverse_from_pid(*right);
-                self.edges.push(EdgeData {
-                    source: node_id,
-                    target: right_node_id,
-                    label: "right".to_string(),
-                });
-                format!(
-                    "Delta::SplitChild PID={}\nsep={}, right={}",
-                    pid.0, separator, right.0
-                )
-            }
-            Delta::IndexEntry { separator, right } => {
-                let right_node_id = self.traverse_from_pid(*right);
-                self.edges.push(EdgeData {
-                    source: node_id,
-                    target: right_node_id,
-                    label: "right".to_string(),
-                });
-                format!(
-                    "Delta::IndexEntry PID={}\nsep={}, right={}",
-                    pid.0, separator, right.0
-                )
-            }
-        };
-
-        self.nodes.push(NodeData {
-            id: node_id,
-            pid,
-            node_type: NodeType::Delta,
-            page: ptr,
-            label,
-        });
-    }
-
-    /// Process the next node in a delta chain
-    fn process_next_node(&mut self, ptr: Shared<'a, Page<K, V>>, node_id: usize) {
-        let page = unsafe { &*ptr.as_raw() };
-        match page {
-            Page::BaseLeaf { entries: items, .. } => {
-                let label = format!("BaseLeaf\n{}", self.format_items(items.as_slice()));
-                self.nodes.push(NodeData {
-                    id: node_id,
-                    pid: PID(0), // Temporary PID, not a real one
-                    node_type: NodeType::BaseLeaf,
-                    page: ptr,
-                    label,
-                });
-            }
-            Page::BaseIndex { entries: items, .. } => {
-                let label = format!("BaseIndex\n{}", self.format_index_items(items.as_slice()));
-                self.nodes.push(NodeData {
-                    id: node_id,
-                    pid: PID(0), // Temporary PID, not a real one
-                    node_type: NodeType::BaseIndex,
-                    page: ptr,
-                    label,
-                });
-
-                // We won't follow the children here to avoid circular references
-            }
-            Page::Delta { delta, next } => {
-                // Process this delta node
-                self.process_delta(PID(0), ptr, node_id, delta);
-
-                // Follow the delta chain
-                let next_ptr = next.load(std::sync::atomic::Ordering::Acquire, &self.guard);
-                let next_node_id = self.nodes.len();
-
-                // Add next node
-                self.process_next_node(next_ptr, next_node_id);
-
-                // Add edge to next node in delta chain
-                self.edges.push(EdgeData {
-                    source: node_id,
-                    target: next_node_id,
-                    label: "next".to_string(),
-                });
-            }
-        }
+        idx
     }
 
     /// Format items for display in a node label
@@ -303,14 +338,12 @@ where
 
 type Node = usize;
 type Edge = (usize, usize, String);
+
 impl<'a, K, V> Labeller<'a, usize, (usize, usize, String)> for BwTreeGraph<'a, K, V>
 where
     K: Display + Ord + PartialEq + Clone + 'static,
     V: Display + Clone,
 {
-    // type Node = usize;
-    // type Edge = (usize, usize, String);
-
     fn graph_id(&'a self) -> Id<'a> {
         Id::new("bwtree").unwrap()
     }
@@ -364,7 +397,12 @@ where
     fn edges(&'a self) -> Edges<'a, Edge> {
         self.edges
             .iter()
-            .map(|e| (e.source, e.target, e.label.clone()))
+            .map(|e| {
+                // Map NodeId to indices in nodes Vec
+                let source_idx = self.node_indices[&e.source];
+                let target_idx = self.node_indices[&e.target];
+                (source_idx, target_idx, e.label.clone())
+            })
             .collect()
     }
 
@@ -471,3 +509,4 @@ mod tests {
         // tree.save_visualization("test_tree.dot").unwrap();
     }
 }
+

@@ -42,8 +42,11 @@ pub enum Page<K, V> {
     },
 }
 
-const MAX_BASE: usize = 512;
-const DELTA_CHAIN_THRESHOLD: usize = 8;
+// const MAX_BASE: usize = 512;
+// const DELTA_CHAIN_THRESHOLD: usize = 8;
+
+const MAX_BASE: usize = 32;
+const DELTA_CHAIN_THRESHOLD: usize = 4;
 
 #[derive(Debug)]
 pub struct Ref<'a, K, V> {
@@ -734,7 +737,7 @@ fn test_visualization() {
     let tree = BwTreeMap::<i32, String>::new();
 
     // Insert some values to create a more complex structure
-    for i in 1..50 {
+    for i in 1..100 {
         tree.insert(i, format!("value_{}", i));
 
         // Delete some values to create delete deltas
