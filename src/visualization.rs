@@ -88,10 +88,17 @@ where
         // Process the node based on its type
         let page = unsafe { &*ptr.as_raw() };
         match page {
-            Page::BaseLeaf { entries: items, .. } => {
+            Page::BaseLeaf {
+                entries: items,
+                side_link,
+            } => {
                 let label = format!(
-                    "BaseLeaf PID={}\n{}",
+                    "BaseLeaf PID={} SIDE_LINK={} ({} count)\n{}",
                     pid.0,
+                    side_link
+                        .map(|l| l.0.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    items.len(),
                     self.format_items(items.as_slice())
                 );
                 self.nodes.push(NodeData {
@@ -102,10 +109,17 @@ where
                     label,
                 });
             }
-            Page::BaseIndex { entries: items, .. } => {
+            Page::BaseIndex {
+                entries: items,
+                side_link,
+            } => {
                 let label = format!(
-                    "BaseIndex PID={}\n{}",
+                    "BaseIndex PID={} SIDE_LINK={} ({} count)\n{}",
                     pid.0,
+                    side_link
+                        .map(|l| l.0.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    items.len(),
                     self.format_index_items(items.as_slice())
                 );
                 self.nodes.push(NodeData {
@@ -457,4 +471,3 @@ mod tests {
         // tree.save_visualization("test_tree.dot").unwrap();
     }
 }
-
