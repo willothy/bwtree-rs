@@ -1,3 +1,14 @@
 digraph bwtree {
-    node0[label="BaseLeaf PID=0\n1:value_1, 2:value_2, 3:value_3, 4:value_4, 6:value_6, 7:value_7..."][style="filled"][color="lightblue"][shape="box"];
+    node0[label="Delta::IndexEntry PID=0\nsep=18, right=0"][style="filled"][color="lightyellow"][shape="ellipse"];
+    node1[label="Delta::Insert PID=1\nkey=49, value=value_49"][style="filled"][color="lightyellow"][shape="ellipse"];
+    node2[label="Delta::Insert PID=0\nkey=48, value=value_48"][style="filled"][color="lightyellow"][shape="ellipse"];
+    node3[label="BaseLeaf\n18:value_18, 19:value_19, 20:value_20, 21:value_21, 22:value_22, 23:value_23..."][style="filled"][color="lightblue"][shape="box"];
+    node4[label="Delta::SplitChild PID=0\nsep=18, right=1"][style="filled"][color="lightyellow"][shape="ellipse"];
+    node5[label="BaseLeaf\n1:value_1, 2:value_2, 3:value_3, 4:value_4, 5:value_5, 6:value_6..."][style="filled"][color="lightblue"][shape="box"];
+    node0 -> node0[label="right"];
+    node2 -> node3[label="next"];
+    node1 -> node2[label="next"];
+    node1 -> node1[label="right"];
+    node1 -> node5[label="next"];
+    node0 -> node1[label="next"];
 }
