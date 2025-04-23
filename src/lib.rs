@@ -1,12 +1,13 @@
 use std::{ops::Deref, sync::atomic::AtomicUsize};
 
 use arc_slice::ArcSlice;
-use crossbeam::epoch::{Atomic, CompareExchangeError, Owned, Shared};
+use crossbeam::epoch::{Atomic, Collector, CompareExchangeError, Owned, Shared};
 
 mod arc_slice;
 pub mod visualization;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(transparent)]
 pub struct PID(pub usize);
 
 #[repr(C)]
@@ -41,8 +42,8 @@ pub enum Page<K, V> {
     },
 }
 
-const MAX_BASE: usize = 32;
-const DELTA_CHAIN_THRESHOLD: usize = 4;
+const MAX_BASE: usize = 512;
+const DELTA_CHAIN_THRESHOLD: usize = 8;
 
 #[derive(Debug)]
 pub struct Ref<'a, K, V> {
@@ -60,6 +61,7 @@ impl<'a, K, V> Ref<'a, K, V> {
         self.value
     }
 }
+
 impl<'a, K, V> Deref for Ref<'a, K, V> {
     type Target = &'a V;
 
@@ -98,11 +100,14 @@ fn has_index_entry<'a, K: Ord, V>(
 
 pub struct BwTreeMap<K, V> {
     slots: boxcar::Vec<Atomic<Page<K, V>>>,
-    root: AtomicUsize,
+    root: atomic::Atomic<PID>,
+    collector: Collector,
 }
 
 impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     pub fn new() -> Self {
+        let collector = Collector::new();
+
         let slots = boxcar::Vec::with_capacity(4);
 
         let root = slots.push(Atomic::new(Page::BaseLeaf {
@@ -112,16 +117,21 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
 
         Self {
             slots,
-            root: root.into(),
+            root: atomic::Atomic::new(PID(root)),
+            collector,
         }
     }
 
+    pub(crate) fn pin(&self) -> crossbeam::epoch::Guard {
+        self.collector.register().pin()
+    }
+
     pub(crate) fn root(&self) -> PID {
-        PID(self.root.load(std::sync::atomic::Ordering::SeqCst))
+        self.root.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn insert<'a>(&self, key: K, value: V) {
-        let guard = crossbeam::epoch::pin();
+        let guard = self.pin();
         let mut stack = Vec::new();
         let pid = self.find_leaf(self.root(), &key, &mut stack, &guard);
 
@@ -169,7 +179,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     }
 
     pub fn get<'a>(&self, key: &K) -> Option<Ref<'a, K, V>> {
-        let guard = crossbeam::epoch::pin();
+        let guard = self.pin();
         let mut pid = self.root();
 
         loop {
@@ -224,7 +234,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     }
 
     pub fn delete<'a>(&self, key: K) {
-        let guard = crossbeam::epoch::pin();
+        let guard = self.pin();
 
         let mut stack = Vec::new();
         let pid = self.find_leaf(self.root(), &key, &mut stack, &guard);
@@ -368,7 +378,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
     }
 
     fn try_split(&self, pid: PID, parent_pid: PID) -> Result<(), ()> {
-        let guard = crossbeam::epoch::pin();
+        let guard = self.pin();
 
         // This node is called P in the "Child Split" section of the paper
         let node = self.load(pid, &guard);
