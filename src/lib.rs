@@ -176,9 +176,9 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
         }
 
-        let parent = stack.pop().unwrap();
+        stack.pop();
 
-        self.maybe_consolidate(pid, parent, &guard).ok();
+        self.maybe_consolidate(pid, &stack, &guard).ok();
     }
 
     pub fn get<'a>(&self, key: &K) -> Option<Ref<'a, K, V>> {
@@ -280,14 +280,15 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
         }
 
-        self.maybe_consolidate(pid, stack.pop().unwrap(), &guard)
-            .ok();
+        stack.pop();
+
+        self.maybe_consolidate(pid, &stack, &guard).ok();
     }
 
     fn maybe_consolidate(
         &self,
         pid: PID,
-        parent_pid: PID,
+        chain: &[PID],
         guard: &crossbeam::epoch::Guard,
     ) -> Result<(), ()> {
         enum Op<'a, K, V> {
@@ -331,7 +332,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         };
 
         let mut base_items = base.to_vec();
-        for op in ops.into_iter() {
+        for op in ops.into_iter().rev() {
             match op {
                 Op::Insert { key, value } => {
                     match base_items.binary_search_by_key(&key, |(k, _)| k) {
@@ -364,6 +365,8 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             guard,
         ) {
             Ok(_) => {
+                let parent_pid = chain.iter().next().copied();
+
                 // We successfully consolidated the page.
                 // Now we need to check if we need to split the parent.
                 if len > MAX_BASE {
@@ -380,7 +383,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
         }
     }
 
-    fn try_split(&self, pid: PID, parent_pid: PID) -> Result<(), ()> {
+    fn try_split(&self, pid: PID, parent_pid: Option<PID>) -> Result<(), ()> {
         let guard = self.pin();
 
         // This node is called P in the "Child Split" section of the paper
@@ -433,7 +436,15 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                     }
                 }
 
-                let mut parent_head = self.load(parent_pid, &guard);
+                let parent_pid_resolved = match parent_pid {
+                    Some(parent_pid) => parent_pid,
+                    None => PID(self.slots.push(Atomic::from(Page::BaseIndex {
+                        entries: ArcSlice::from_vec(vec![(separator.clone(), new_right_pid)]),
+                        side_link: Some(pid),
+                    }))),
+                };
+
+                let mut parent_head = self.load(parent_pid_resolved, &guard);
                 let mut idx_delta = Owned::new(Page::Delta {
                     delta: Delta::IndexEntry {
                         separator: separator.clone(),
@@ -443,7 +454,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 });
 
                 loop {
-                    match self.slots[parent_pid.0].compare_exchange(
+                    match self.slots[parent_pid_resolved.0].compare_exchange(
                         parent_head,
                         idx_delta,
                         std::sync::atomic::Ordering::AcqRel,
@@ -451,6 +462,12 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                         &guard,
                     ) {
                         Ok(_) => {
+                            if parent_pid.is_none() {
+                                self.root.store(
+                                    parent_pid_resolved,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                            }
                             break;
                         }
                         Err(CompareExchangeError { new, current }) => {
@@ -529,79 +546,26 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                     Page::Delta { next, .. } => {
                         head = next.load(std::sync::atomic::Ordering::Acquire, guard);
                     }
-                    Page::BaseIndex { entries: items, .. } => {
-                        pid = match items.binary_search_by_key(&key, |(k, _)| k) {
-                            Ok(i) | Err(i) => items[i].1,
+                    Page::BaseIndex {
+                        entries: items,
+                        side_link,
+                    } => {
+                        match items.binary_search_by_key(&key, |(k, _)| k) {
+                            Ok(i) => {
+                                pid = items[i].1;
+                            }
+                            Err(_i) => {
+                                if let Some(side_link) = side_link {
+                                    pid = *side_link;
+                                }
+                                //
+                            }
                         };
                         break 'inner;
                     }
                     Page::BaseLeaf { .. } => {
                         return pid;
                     }
-                }
-            }
-        }
-    }
-
-    fn find_in_slot<'a>(
-        &self,
-        pid: PID,
-        key: &K,
-        guard: &'a crossbeam::epoch::Guard,
-    ) -> Option<(&'a K, &'a V)> {
-        let mut ptr = self.load(pid, &guard);
-
-        loop {
-            // Safety: We are guaranteed that the pointer is non-null because we
-            // always initialize slots before pointing at them. The allocation is guaranteed
-            // to be valid because we are holding a guard and the output's lifetime is bound
-            // to that of the guard.
-            let page = unsafe { &*ptr.as_raw() };
-
-            match page {
-                Page::Delta { delta, next } => match delta {
-                    Delta::Insert {
-                        key: rec_key,
-                        value,
-                    } if rec_key == key => {
-                        return Some((rec_key, value));
-                    }
-                    Delta::Delete { key: rec_key } if rec_key == key => return None,
-                    Delta::SplitChild { separator, right } => {
-                        if key >= separator {
-                            ptr = self.load(*right, guard);
-                            continue;
-                            // return self.find_in_slot(*right, key, guard);
-                        } else {
-                            ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
-                        }
-                    }
-                    // Delta::IndexEntry { separator, right } => {
-                    //     if key >= separator {
-                    //         ptr = self.load(*right, guard);
-                    //         continue;
-                    //     }
-                    // }
-                    // Delta::MergeSibling { separator, right } => todo!(),
-                    _ => {
-                        ptr = next.load(std::sync::atomic::Ordering::Acquire, &guard);
-                    }
-                },
-                Page::BaseIndex { entries: items, .. } => {
-                    match items.binary_search_by_key(&key, |(k, _)| k) {
-                        Ok(index) => {
-                            let (_k, pid) = &items[index];
-                            ptr = self.load(*pid, guard);
-                            continue;
-                        }
-                        Err(_) => {}
-                    }
-                }
-                Page::BaseLeaf { entries: items, .. } => {
-                    return items
-                        .binary_search_by_key(&key, |(k, _)| k)
-                        .ok()
-                        .map(|index| (&items[index].0, &items[index].1));
                 }
             }
         }
