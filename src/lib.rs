@@ -1,4 +1,4 @@
-use std::{ops::Deref, sync::atomic::AtomicUsize};
+use std::ops::Deref;
 
 use arc_slice::ArcSlice;
 use crossbeam::epoch::{Atomic, Collector, CompareExchangeError, Owned, Shared};
@@ -42,11 +42,11 @@ pub enum Page<K, V> {
     },
 }
 
-// const MAX_BASE: usize = 512;
-// const DELTA_CHAIN_THRESHOLD: usize = 8;
+const MAX_BASE: usize = 512;
+const DELTA_CHAIN_THRESHOLD: usize = 8;
 
-const MAX_BASE: usize = 32;
-const DELTA_CHAIN_THRESHOLD: usize = 4;
+// const MAX_BASE: usize = 32;
+// const DELTA_CHAIN_THRESHOLD: usize = 4;
 
 #[derive(Debug)]
 pub struct Ref<'a, K, V> {
@@ -176,9 +176,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
         }
 
-        stack.pop();
+        if stack.len() >= DELTA_CHAIN_THRESHOLD {
+            stack.pop();
 
-        self.maybe_consolidate(pid, &stack, &guard).ok();
+            self.maybe_consolidate(pid, &stack, &guard).ok();
+        }
     }
 
     pub fn get<'a>(&self, key: &K) -> Option<Ref<'a, K, V>> {
@@ -280,9 +282,11 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
             }
         }
 
-        stack.pop();
+        if stack.len() >= DELTA_CHAIN_THRESHOLD {
+            stack.pop();
 
-        self.maybe_consolidate(pid, &stack, &guard).ok();
+            self.maybe_consolidate(pid, &stack, &guard).ok();
+        }
     }
 
     fn maybe_consolidate(
@@ -370,7 +374,7 @@ impl<K: Ord + PartialEq + Clone + 'static, V: Clone> BwTreeMap<K, V> {
                 // We successfully consolidated the page.
                 // Now we need to check if we need to split the parent.
                 if len > MAX_BASE {
-                    while let Err(_) = self.try_split(pid, parent_pid) {}
+                    self.try_split(pid, parent_pid).ok();
                 }
                 Ok(())
             }

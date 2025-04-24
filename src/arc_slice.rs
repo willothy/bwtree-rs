@@ -3,69 +3,43 @@ use std::{
     sync::Arc,
 };
 
+use owning_ref::ArcRef;
+
 /// Immutable, shareable subslice with O(1) slicing.
 ///
 /// Cloning is cheap; dropping decrements the shared reference count.
 #[derive(Clone)]
-pub struct ArcSlice<T> {
-    data: Arc<[T]>,
-    start: usize,
-    len: usize,
-}
+pub struct ArcSlice<T>(owning_ref::ArcRef<[T]>);
 
 impl<T> ArcSlice<T> {
     pub fn new(data: Arc<[T]>) -> Self {
-        Self {
-            start: 0,
-            len: data.len(),
-            data,
-        }
+        Self(ArcRef::new(data))
     }
 
     pub fn empty() -> Self {
-        Self {
-            data: Arc::new([]),
-            start: 0,
-            len: 0,
-        }
+        Self(ArcRef::new(Arc::new([])))
     }
 
-    /// Wrap an owned vector (no copy).
     pub fn from_vec(v: Vec<T>) -> Self {
-        let len = v.len();
-        Self {
-            data: Arc::<[T]>::from(v),
-            start: 0,
-            len,
-        }
-    }
-
-    /// Wrap an existing `Arc<[T]>` (useful when you already have shared data).
-    pub fn from_arc(data: Arc<[T]>) -> Self {
-        let len = data.len();
-        Self {
-            data,
-            start: 0,
-            len,
-        }
+        Self(ArcRef::new(Arc::<[T]>::from(v)))
     }
 
     /// The subslice as a plain `&[T]`.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
-        &self.data[self.start..self.start + self.len]
+        &self.0
     }
 
     /// Total number of elements in *this* view (not the full allocation!).
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.0.len()
     }
 
     /// `true` if the view is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.0.is_empty()
     }
 
     /// Create a further subslice in **O(1)**.
@@ -76,13 +50,9 @@ impl<T> ArcSlice<T> {
         R: RangeBounds<usize>,
     {
         // Convert the requested range into absolute indices relative to self.
-        let Range { start, end } = normalize(range, self.len);
+        let Range { start, end } = normalize(range, self.len());
 
-        Self {
-            data: self.data.clone(),
-            start: self.start + start,
-            len: end - start,
-        }
+        Self(ArcRef::clone(&self.0).map(|o| &o[start..end]))
     }
 }
 
@@ -112,6 +82,7 @@ where
 
 impl<T> Deref for ArcSlice<T> {
     type Target = [T];
+
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
@@ -160,6 +131,6 @@ mod tests {
         assert_eq!(&*middle, &[3, 4]);
 
         // Confirm they all share one allocation.
-        assert_eq!(Arc::strong_count(&data.data), 4);
+        assert_eq!(Arc::strong_count(&data.0.as_owner()), 4);
     }
 }
