@@ -4,6 +4,7 @@ use arc_slice::ArcSlice;
 use crossbeam::epoch::{Atomic, Collector, CompareExchangeError, Owned, Shared};
 
 mod arc_slice;
+mod ring_chain;
 pub mod visualization;
 
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -43,6 +44,8 @@ pub enum Page<K, V> {
 }
 
 const MAX_BASE: usize = 512;
+
+/// Note: This *MUST* be <= u8::MAX
 const DELTA_CHAIN_THRESHOLD: usize = 8;
 
 // const MAX_BASE: usize = 32;
