@@ -1,8 +1,8 @@
-# 🌀 BWTree‑RS
+# 🌀 BWTree‑RS
 
 *A latch‑free, cache‑friendly, fully in‑memory Bw‑tree for Rust.*
 
-> “One CAS per write, zero latches, millions of ops per second.”
+> "One CAS per write, zero latches, millions of ops per second."
 
 BW-trees provide high concurrency and performance for modern multi-core systems.
 
@@ -10,7 +10,7 @@ BW-trees provide high concurrency and performance for modern multi-core systems.
 
 ---
 
-## ✨ Features
+## ✨ Features
 
 | ✅ | Description |
 |----|-------------|
@@ -27,7 +27,7 @@ BW-trees provide high concurrency and performance for modern multi-core systems.
 
 ---
 
-## 📦 Getting started
+## 📦 Getting started
 
 ```bash
 cargo add bwtree --git https://github.com/willothy/bwtree-rs
@@ -48,7 +48,7 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 
 ---
 
-## 🏗️ Architecture snapshot
+## 🏗️ Architecture snapshot
 
 ```
       MappingTable                 Page 0
@@ -74,7 +74,7 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 
 ```
 
-* **Single CAS = serialisation**
+* **Single CAS = serialisation**
   Every update prepends a *delta* node and installs it with `compare_exchange`.
 * **Side links & helper rule**
   Incomplete splits/merges are finished by the thread that sees them → lock‑free progress. (TODO)
@@ -83,7 +83,7 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 
 ---
 
-## 🚧 To Do
+## 🚧 To Do
 
 * Implement page consolidation
 * Add range queries
@@ -97,7 +97,65 @@ assert_eq!(map.get(&42, &guard), Some("life"));
 * [Building a Bw-Tree Takes More Than Just Buzz Words (CMU)](https://db.cs.cmu.edu/papers/2018/mod342-wangA.pdf)
   * Video talk [here](https://www.youtube.com/watch?v=UxuFL8dgiEw)
 
-## 📜 License (Apache-2.0)
+## 📊 Visualization
+
+This implementation includes a visualization module that can generate Graphviz DOT files to help understand the structure and behavior of the BwTree.
+
+### Requirements
+
+- [Graphviz](https://graphviz.org/) must be installed to generate PNG/SVG files from DOT files
+
+### Usage
+
+#### Visualizing a BwTree
+
+```rust
+use bwtree::{BwTreeMap, visualization::BwTreeVisualize};
+
+// Create a BwTree
+let tree = BwTreeMap::<i32, String>::new();
+
+// Add some data
+tree.insert(1, "one".to_string());
+tree.insert(2, "two".to_string());
+tree.insert(3, "three".to_string());
+
+// Generate DOT representation as a string
+let dot_code = tree.visualize();
+
+// Or save directly to a file
+tree.save_visualization("my_bwtree.dot").unwrap();
+
+// Convert DOT to an image if you have GraphViz installed
+bwtree::visualization::generate_image("my_bwtree.dot", "my_bwtree.png").unwrap();
+```
+
+#### Running the Example
+
+```
+cargo run --example visualize [output_file.dot]
+```
+
+This will:
+1. Create a BwTree
+2. Populate it with sample data
+3. Generate a DOT file visualization
+4. Attempt to create a PNG image using GraphViz (if installed)
+
+#### Understanding the Visualization
+
+The visualization uses colors and shapes to represent different node types:
+
+- **Light blue boxes**: Base leaf nodes containing key-value pairs
+- **Light green boxes**: Base index nodes containing key-pid pairs
+- **Light yellow ellipses**: Delta nodes (Insert, Delete, SplitChild, IndexEntry)
+
+Edges represent relationships between nodes:
+- **next**: Links between delta nodes in a delta chain
+- **right**: Links to right siblings in split operations
+- **idx=X**: Links from index nodes to their children
+
+## 📜 License (Apache-2.0)
 
 Copyright 2025 Will Hopkins
 

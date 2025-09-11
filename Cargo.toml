@@ -6,5 +6,9 @@ description = "A Rust implementation of the Bw-tree data structure"
 license = "MIT"
 
 [dependencies]
+atomic = { version = "0.6.0", features = ["std"] }
 boxcar = "0.2.11"
+bytemuck = { version = "1.22.0", features = ["derive"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-epoch"] }
+dot = "0.1.4"
+owning_ref = "0.4.1"
